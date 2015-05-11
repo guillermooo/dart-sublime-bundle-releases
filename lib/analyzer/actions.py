@@ -15,6 +15,7 @@ from Dart.sublime_plugin_lib.panels import OutputPanel
 
 from Dart.lib.analyzer.api.protocol import AnalysisErrorSeverity
 from Dart.lib.analyzer.api.protocol import AnalysisErrorType
+from Dart import editor_context
 
 
 _logger = PluginLogger(__name__)
@@ -32,6 +33,10 @@ DAS_UI_REGIONS_ERRORS = 'dart.errors'
 _flags = (sublime.DRAW_SQUIGGLY_UNDERLINE |
           sublime.DRAW_NO_FILL |
           sublime.DRAW_NO_OUTLINE)
+
+
+def handle_navigation_data(navigation_params):
+    editor_context.navigation = navigation_params
 
 
 def show_errors(errors):
@@ -100,18 +105,23 @@ def show_errors(errors):
 
     all_errs = set(errs_patts + warn_patts + info_patts)
 
+    panel = OutputPanel('dart.analyzer')
+
     if not all_errs:
-        panel = OutputPanel('dart.analyzer')
+        editor_context.errors = []
         panel.hide()
         return
 
-    panel = OutputPanel('dart.analyzer')
     errors_pattern = r'^\w+\|\w+\|(.+)\|(\d+)\|(\d+)\|(.+)$'
     panel.set('result_file_regex', errors_pattern)
     # This will overwrite any previous text.
     panel.write('\n' + '\n'.join(all_errs))
+    panel.view.set_syntax_file('Packages/Dart/Support/Analyzer Output.sublime-syntax')
+    panel.view.settings().set('rulers', [])
     panel.show()
     sublime.status_message("Dart: Errors found")
+
+    editor_context.errors = all_errs
 
 
 def clear_ui():

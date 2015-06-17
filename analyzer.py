@@ -34,6 +34,9 @@ from Dart.lib.analyzer.api.protocol import AnalysisSetAnalysisRootsParams
 from Dart.lib.analyzer.api.protocol import AnalysisSetPriorityFilesParams
 from Dart.lib.analyzer.api.protocol import AnalysisSetSubscriptionsParams
 from Dart.lib.analyzer.api.protocol import AnalysisUpdateContentParams
+from Dart.lib.analyzer.api.protocol import CompletionGetSuggestionsParams
+from Dart.lib.analyzer.api.protocol import CompletionGetSuggestionsResult
+from Dart.lib.analyzer.api.protocol import CompletionResultsParams
 from Dart.lib.analyzer.api.protocol import RemoveContentOverlay
 from Dart.lib.analyzer.api.protocol import ServerGetVersionParams
 from Dart.lib.analyzer.api.protocol import ServerGetVersionResult
@@ -48,6 +51,7 @@ from Dart.lib.error import ConfigError
 from Dart.lib.path import find_pubspec_path
 from Dart.lib.path import is_path_under
 from Dart.lib.path import is_view_dart_script
+from Dart.lib.path import only_for_dart_files
 from Dart.lib.sdk import SDK
 
 
@@ -59,14 +63,6 @@ _SIGNAL_STOP = '__SIGNAL_STOP'
 
 
 g_server = None
-
-# maps:
-#   req_type => view_id
-#   view_id => valid token for this type of request
-# Abstract this out into a class that provides its own synchronization.
-g_req_to_resp = {
-    "search": {},
-}
 
 
 def init():
@@ -92,7 +88,7 @@ def plugin_loaded():
     if not sdk.enable_analysis_server:
         return
     try:
-        sdk.path_to_analysis_snapshot
+        sdk.check_for_critical_configuration_errors()
     except ConfigError as e:
         print("Dart: " + str(e))
         _logger.error(e)
@@ -114,58 +110,42 @@ def plugin_unloaded():
 
 
 class ActivityTracker(sublime_plugin.EventListener):
-    """After ST has been idle for an interval, sends requests to the analyzer
+    """
+    After ST has been idle for an interval, sends requests to the analyzer
     if the buffer has been saved or is dirty.
     """
+
     edits = defaultdict(lambda: 0)
     edits_lock = threading.RLock()
 
     def increment_edits(self, view):
-        # XXX: It seems that this function gets called twice for each edit to a buffer.
         with ActivityTracker.edits_lock:
             ActivityTracker.edits[view.id()] += 1
-        sublime.set_timeout(lambda: self.check_idle(view), 750)
+        sublime.set_timeout(lambda: self.check_idle(view), 1200)
 
     def decrement_edits(self, view):
         with ActivityTracker.edits_lock:
             if ActivityTracker.edits[view.id()] > 0:
                 ActivityTracker.edits[view.id()] -= 1
 
+    @only_for_dart_files
     def on_load(self, view):
-        if not is_view_dart_script(view):
-            return
-
         with ActivityTracker.edits_lock:
             ActivityTracker.edits[view.id()] = 0
 
         if AnalysisServer.ping():
             g_server.send_remove_content(view)
 
+    @only_for_dart_files
     def on_idle(self, view):
-        if not is_view_dart_script(view):
-            return
-
-        # _logger.debug("active view was idle; could send requests")
         if AnalysisServer.ping():
             if view.is_dirty() and is_active(view):
                 _logger.debug('sending overlay data for %s', view.file_name())
                 g_server.send_add_content(view)
 
     # TODO(guillermooo): Use on_modified_async
+    @only_for_dart_files
     def on_modified(self, view):
-        if not is_view_dart_script(view):
-            # Don't log here -- it'd impact performance.
-            # _logger.debug('on_modified - not a dart file; aborting: %s',
-            #     view.file_name())
-            return
-
-        if not view.file_name():
-            # Don't log here -- it'd impact performance.
-            # _logger.debug(
-            #     'aborting because file does not exist on disk: %s',
-            #     view.file_name())
-            return
-
         # if we've `revert`ed the buffer, it'll be clean
         if not view.is_dirty():
             self.on_load(view)
@@ -179,12 +159,8 @@ class ActivityTracker(sublime_plugin.EventListener):
             if self.edits[view.id()] == 0:
                 self.on_idle(view)
 
+    @only_for_dart_files
     def on_post_save(self, view):
-        if not is_view_dart_script(view):
-            # _logger.debug('on_post_save - not a dart file %s',
-            #               view.file_name())
-            return
-
         with ActivityTracker.edits_lock:
             # TODO(guillermooo): does .id() uniquely identify views
             # across windows?
@@ -195,6 +171,7 @@ class ActivityTracker(sublime_plugin.EventListener):
         if AnalysisServer.ping():
             g_server.send_remove_content(view)
 
+    @only_for_dart_files
     def on_deactivated(self, view):
         # Any ongoing searches must be invalidated.
         del editor_context.search_id
@@ -202,12 +179,8 @@ class ActivityTracker(sublime_plugin.EventListener):
         if not is_view_dart_script(view):
             return
 
+    @only_for_dart_files
     def on_activated(self, view):
-        if not is_view_dart_script(view):
-            # _logger.debug('on_activated - not a dart file %s',
-            #               view.file_name())
-            return
-
         if AnalysisServer.ping() and not view.is_loading():
             g_server.add_root(view.file_name())
 
@@ -229,13 +202,6 @@ class StdoutWatcher(threading.Thread):
 
     def start(self):
         _logger.info("starting StdoutWatcher")
-
-        try:
-            # Awaiting other threads...
-            self.server.ready_barrier.wait()
-        except threading.BrokenBarrierError:
-            _logger.error('could not start StdoutWatcher properly')
-            return
 
         while True:
             try:
@@ -267,8 +233,6 @@ class StdoutWatcher(threading.Thread):
 
 class AnalysisServer(object):
     MAX_ID = 9999999
-    # Halts all worker threads until the server is ready.
-    _ready_barrier = threading.Barrier(4, timeout=5)
 
     _request_id_lock = threading.Lock()
     _op_lock = threading.Lock()
@@ -277,10 +241,6 @@ class AnalysisServer(object):
     _request_id = -1
 
     server = None
-
-    @property
-    def ready_barrier(self):
-        return AnalysisServer._ready_barrier
 
     @property
     def stdout(self):
@@ -311,6 +271,8 @@ class AnalysisServer(object):
         self.requests = RequestsQueue('requests')
         self.responses = AnalyzerQueue('responses')
 
+
+    def start_handlers(self):
         reqh = RequestHandler(self)
         reqh.daemon = True
         reqh.start()
@@ -324,7 +286,8 @@ class AnalysisServer(object):
         return AnalysisServer.server
 
     def add_root(self, path):
-        """Adds `path` to the monitored roots if it is unknown.
+        """
+        Adds `path` to the monitored roots if it is unknown.
 
         If a `pubspec.yaml` is found in the path, its parent is monitored.
         Otherwise the passed-in directory name is monitored.
@@ -332,6 +295,7 @@ class AnalysisServer(object):
         @path
           Can be a directory or a file path.
         """
+
         if not path:
             _logger.debug('not a valid path: %s', path)
             return
@@ -366,24 +330,25 @@ class AnalysisServer(object):
         AnalysisServer.server = PipeServer([sdk.path_to_dart,
                             sdk.path_to_analysis_snapshot,
                            '--sdk={0}'.format(sdk.path)])
-        AnalysisServer.server.start(working_dir=sdk.path)
 
-        self.start_stdout_watcher()
+        def do_start():
+            try:
+                AnalysisServer.server.start(working_dir=sdk.path)
+                self.start_handlers()
+                self.start_stdout_watcher()
+            except Exception as e:
+                _logger.error('could not start server properly')
+                _logger.error(e)
+                return
 
-        try:
-            # Server is ready.
-            self.ready_barrier.wait()
-        except threading.BrokenBarrierError:
-            _logger.error('could not start server properly')
-            return
+        threading.Thread(target=do_start).start()
 
     def start_stdout_watcher(self):
         sdk = SDK()
         t = StdoutWatcher(self, sdk.path)
         # Thread dies with the main thread.
         t.daemon = True
-        # XXX: This is necessary. If we call t.start() directly, ST hangs.
-        sublime.set_timeout_async(t.start, 0)
+        t.start()
 
     def stop(self):
         req = requests.shut_down(str(AnalysisServer.MAX_ID + 100))
@@ -417,7 +382,7 @@ class AnalysisServer(object):
     def send_add_content(self, view):
         if self.should_ignore_file(view.file_name()):
             return
-            
+
         content = view.substr(sublime.Region(0, view.size()))
         req = AnalysisUpdateContentParams({view.file_name(): AddContentOverlay(content)})
         _logger.info('sending update content request - add')
@@ -431,7 +396,7 @@ class AnalysisServer(object):
     def send_remove_content(self, view):
         if self.should_ignore_file(view.file_name()):
             return
-            
+
         req = AnalysisUpdateContentParams({view.file_name(): RemoveContentOverlay()})
         _logger.info('sending update content request - delete')
         self.requests.put(req.to_request(self.get_request_id()),
@@ -455,6 +420,20 @@ class AnalysisServer(object):
         self.requests.put(req2.to_request(self.get_request_id()),
                 priority=TaskPriority.HIGH, block=False)
 
+    def send_get_suggestions(self, view, file, offset):
+        new_id = self.get_request_id()
+
+        with editor_context.autocomplete_context as actx:
+            actx.invalidate()
+            actx.request_id = new_id
+
+        editor_context.set_id(view, new_id)
+
+        req = CompletionGetSuggestionsParams(file, offset)
+        req = req.to_request(new_id)
+
+        self.requests.put(req, priority=TaskPriority.HIGH, block=False)
+
     def should_ignore_file(self, path):
         project = DartProject.from_path(path)
         is_a_third_party_file = (project and is_path_under(project.path_to_packages, path))
@@ -477,13 +456,6 @@ class ResponseHandler(threading.Thread):
     def run(self):
         _logger.info('starting ResponseHandler')
 
-        try:
-            # Awaiting other threads...
-            self.server.ready_barrier.wait()
-        except threading.BrokenBarrierError:
-            _logger.error('could not start ResponseHandler properly')
-            return
-
         response_maker = ResponseMaker(self.server.responses)
 
         try:
@@ -496,7 +468,7 @@ class ResponseHandler(threading.Thread):
                     if resp.get('_internal') == _SIGNAL_STOP:
                         _logger.info('ResponseHandler exiting by internal request.')
                         return
-                
+
                 if isinstance(resp, Notification):
                     if isinstance(resp.params, AnalysisErrorsParams):
                         # Make sure the right type is passed to the async
@@ -513,10 +485,27 @@ class ResponseHandler(threading.Thread):
                               )
                         continue
 
+                    if isinstance(resp.params, CompletionResultsParams):
+                        with editor_context.autocomplete_context as actx:
+                            if actx.request_id or (resp.params.id != actx.id):
+                                actx.invalidate_results()
+                                continue
+                        after(0, actions.handle_completions,
+                              CompletionResultsParams.from_json(resp.params.to_json().copy())
+                              )
+
                 if isinstance(resp, Response):
                     if isinstance(resp.result, ServerGetVersionResult):
                         print('Dart: Analysis Server version:', resp.result.version)
                         continue
+
+                    if isinstance(resp.result, CompletionGetSuggestionsResult):
+                        with editor_context.autocomplete_context as actx:
+                            if resp.id != actx.request_id:
+                                continue
+
+                            actx.id = resp.result.id
+                            actx.request_id = None
 
         except Exception as e:
             msg = 'error in thread' + self.name + '\n'
@@ -534,12 +523,6 @@ class RequestHandler(threading.Thread):
 
     def run(self):
         _logger.info('starting RequestHandler')
-
-        try:
-            self.server.ready_barrier.wait()
-        except threading.BrokenBarrierError:
-            _logger.error('could not start RequestHandler properly')
-            return
 
         while True:
             try:

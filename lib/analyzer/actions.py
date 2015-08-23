@@ -18,7 +18,7 @@ from Dart.sublime_plugin_lib.sublime import R
 from Dart.lib.analyzer.api.protocol import AnalysisErrorSeverity
 from Dart.lib.analyzer.api.protocol import AnalysisErrorType
 from Dart.lib.analyzer.api.protocol import ElementKind
-from Dart import editor_context
+from Dart._init_ import editor_context
 
 
 _logger = PluginLogger(__name__)
@@ -164,8 +164,8 @@ def handle_completions(results):
     show = False
     with editor_context.autocomplete_context as actx:
 
-        _PROPERTY = '\u25CB {}'
-        _FUNCTION = '\u25BA {}'
+        _PROPERTY = '\u25CB {} \u2192 {}'
+        _FUNCTION = '\u25BA {}{} \u2192 {}'
         _CONSTRUCTOR = '\u00A9 {}'
         _OTHER = '· {}'
 
@@ -175,9 +175,11 @@ def handle_completions(results):
             if not c.element:
                 continue
             if c.element.kind == ElementKind.FUNCTION or c.element.kind == ElementKind.METHOD or c.element.kind == ElementKind.SETTER:
-                formatted.append([_FUNCTION.format(c.completion) + c.element.parameters, c.completion + '(${1:%s})$0' % c.element.parameters[1:-1]])
+                # TODO(guillermooo): insert only req params.
+                # formatted.append([_FUNCTION.format(c.completion, c.element.parameters, c.returnType), c.completion + '(${1:%s})$0' % c.element.parameters[1:c.requiredParameterCount]])
+                formatted.append([_FUNCTION.format(c.completion, c.element.parameters, c.returnType), c.completion + '(${1:%s})$0' % c.element.parameters[1:-1]])
             elif c.element.kind == ElementKind.GETTER or c.element.kind == ElementKind.FIELD:
-                formatted.append([_PROPERTY.format(c.completion), c.completion])
+                formatted.append([_PROPERTY.format(c.completion, c.returnType), c.completion])
             elif c.element.kind == ElementKind.CONSTRUCTOR:
                 formatted.append([_CONSTRUCTOR.format(c.completion) + c.element.parameters, c.completion + '(${1:%s})$0' % c.element.parameters[1:-1]])
             else:
@@ -195,3 +197,19 @@ def handle_completions(results):
     v = get_active_view()
     if v:
         v.run_command('auto_complete')
+
+
+def handle_formatting(result):
+    v = get_active_view()
+
+    v.sel().clear()
+
+    for edit in result.edits:
+        v.run_command('dart_replace_region', {
+            'region': [edit.offset, edit.length],
+            'text': edit.replacement
+            })
+
+    r = sublime.Region(result.selectionOffset,
+            result.selectionOffset + result.selectionLength)
+    v.sel().add(r)

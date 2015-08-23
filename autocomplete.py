@@ -8,7 +8,7 @@ from Dart.sublime_plugin_lib.events import IdleIntervalEventListener
 from Dart.sublime_plugin_lib.path import is_active
 
 from Dart import analyzer
-from Dart import editor_context
+from Dart._init_ import editor_context
 from Dart.analyzer import AnalysisServer
 from Dart.lib.path import is_view_dart_script
 from Dart.lib.pub_package import DartFile
@@ -17,7 +17,7 @@ from Dart.lib.pub_package import DartFile
 _logger = PluginLogger(__name__)
 
 
-class IdleAutocomplete(IdleIntervalEventListener):
+class DartIdleAutocomplete(IdleIntervalEventListener):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.duration = 300
@@ -45,6 +45,7 @@ class IdleAutocomplete(IdleIntervalEventListener):
         if not AnalysisServer.ping():
             return
 
+        # First, send new content if any.
         if view.is_dirty() and is_active(view):
             _logger.debug('sending overlay data for %s', view.file_name())
             analyzer.g_server.send_add_content(view)
